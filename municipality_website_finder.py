@@ -42,6 +42,127 @@ class MunicipalityWebsiteFinder:
             LOGGER.error(f"Error loading municipalities: {e}")
             return []
     
+    def extract_municipality_websites_from_nj_gov(self) -> Dict[str, str]:
+        """
+        Extract municipality websites from NJ state government's local government directory.
+        This is more reliable than Google search as it's an official source.
+        """
+        nj_gov_url = "https://www.nj.gov/nj/gov/county/localgov.shtml"
+        results = {}
+        
+        try:
+            LOGGER.info(f"Fetching municipality websites from NJ state government: {nj_gov_url}")
+            
+            response = self.session.get(nj_gov_url, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for municipality links in the page
+            # The structure might vary, so we'll try multiple approaches
+            municipality_links = []
+            
+            # Approach 1: Look for links containing municipality names
+            for link in soup.find_all('a', href=True):
+                href = link.get('href', '')
+                text = link.get_text(strip=True)
+                
+                # Check if this looks like a municipality link
+                if href.startswith('http') and any(keyword in text.lower() for keyword in ['township', 'borough', 'city', 'town', 'village']):
+                    municipality_links.append((text, href))
+            
+            # Approach 2: Look for links in tables or lists
+            tables = soup.find_all('table')
+            for table in tables:
+                for row in table.find_all('tr'):
+                    cells = row.find_all(['td', 'th'])
+                    for cell in cells:
+                        links = cell.find_all('a', href=True)
+                        for link in links:
+                            href = link.get('href', '')
+                            text = link.get_text(strip=True)
+                            if href.startswith('http') and text.strip():
+                                municipality_links.append((text, href))
+            
+            # Approach 3: Look for any links that might be municipality websites
+            for link in soup.find_all('a', href=True):
+                href = link.get('href', '')
+                text = link.get_text(strip=True)
+                
+                # Filter for likely municipality websites
+                if (href.startswith('http') and 
+                    any(domain in href.lower() for domain in ['.gov', '.nj.us', '.us', '.org']) and
+                    text.strip() and len(text) > 2):
+                    municipality_links.append((text, href))
+            
+            # Remove duplicates and clean up
+            unique_links = list(set(municipality_links))
+            
+            LOGGER.info(f"Found {len(unique_links)} potential municipality links")
+            
+            # Try to match with our municipality list
+            municipalities = self.load_municipalities()
+            for municipality in municipalities:
+                best_match = self.find_best_municipality_match(municipality, unique_links)
+                if best_match:
+                    results[municipality] = best_match
+                    LOGGER.info(f"Found website for {municipality}: {best_match}")
+            
+            LOGGER.info(f"Successfully matched {len(results)} municipalities from NJ state government")
+            return results
+            
+        except Exception as e:
+            LOGGER.error(f"Error extracting from NJ state government: {e}")
+            return {}
+    
+    def find_best_municipality_match(self, municipality: str, municipality_links: List[tuple]) -> Optional[str]:
+        """
+        Find the best matching municipality website from the list of links.
+        """
+        if not municipality_links:
+            return None
+        
+        best_match = None
+        best_score = 0
+        
+        municipality_lower = municipality.lower()
+        
+        for link_text, link_url in municipality_links:
+            score = 0
+            link_text_lower = link_text.lower()
+            
+            # Exact name match gets highest score
+            if municipality_lower == link_text_lower:
+                score = 100
+            # Partial name match
+            elif municipality_lower in link_text_lower or link_text_lower in municipality_lower:
+                score = 80
+            # Word-by-word matching
+            else:
+                municipality_words = set(municipality_lower.split())
+                link_words = set(link_text_lower.split())
+                common_words = municipality_words.intersection(link_words)
+                if common_words:
+                    score = len(common_words) * 20
+            
+            # Bonus for government domains
+            if any(domain in link_url.lower() for domain in ['.gov', '.nj.us', '.us']):
+                score += 10
+            
+            # Bonus for exact municipality name in URL
+            if municipality_lower.replace(' ', '').replace('-', '').replace('_', '') in link_url.lower():
+                score += 15
+            
+            if score > best_score:
+                best_score = score
+                best_match = link_url
+        
+        # Only return matches with a reasonable score
+        if best_score >= 20:
+            return best_match
+        
+        return None
+    
     def search_municipality_website(self, municipality: str) -> Optional[str]:
         """
         Search for a municipality's official website using Google.
@@ -196,6 +317,7 @@ class MunicipalityWebsiteFinder:
                 
                 scored_urls.append((url, score))
                 LOGGER.debug(f"Scored URL: {url} with score: {score}")
+                
             except Exception as e:
                 LOGGER.error(f"Error parsing URL {url}: {e}")
                 continue
@@ -214,7 +336,7 @@ class MunicipalityWebsiteFinder:
         return None
     
     def find_all_websites(self) -> Dict[str, str]:
-        """Find websites for all municipalities."""
+        """Find websites for all municipalities using multiple approaches."""
         municipalities = self.load_municipalities()
         if not municipalities:
             return {}
@@ -222,8 +344,17 @@ class MunicipalityWebsiteFinder:
         results = {}
         total = len(municipalities)
         
-        for i, municipality in enumerate(municipalities, 1):
-            LOGGER.info(f"Processing {i}/{total}: {municipality}")
+        # First, try to get websites from NJ state government (most reliable)
+        LOGGER.info("Step 1: Extracting websites from NJ state government directory...")
+        nj_gov_results = self.extract_municipality_websites_from_nj_gov()
+        results.update(nj_gov_results)
+        
+        # Then, use Google search for remaining municipalities
+        remaining_municipalities = [m for m in municipalities if m not in results]
+        LOGGER.info(f"Step 2: Using Google search for {len(remaining_municipalities)} remaining municipalities...")
+        
+        for i, municipality in enumerate(remaining_municipalities, 1):
+            LOGGER.info(f"Processing {i}/{len(remaining_municipalities)}: {municipality}")
             
             website = self.search_municipality_website(municipality)
             if website:
@@ -231,7 +362,7 @@ class MunicipalityWebsiteFinder:
             
             # Progress update
             if i % 10 == 0:
-                LOGGER.info(f"Progress: {i}/{total} municipalities processed")
+                LOGGER.info(f"Progress: {i}/{len(remaining_municipalities)} municipalities processed")
         
         return results
     
