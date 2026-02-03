@@ -1,141 +1,129 @@
-# NJ Municipality Website Finder
+# NJ Affordable Housing Tracker
 
-This script automatically finds the official websites for all NJ municipalities by searching Google and updating a YAML file with the results.
+This project tracks affordable housing commitments by New Jersey municipalities and determines the status of those commitments through news articles and satellite imagery analysis. See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full roadmap.
 
-## Features
+## Project Overview
 
-- **Automated Search**: Searches Google for each municipality's official website
-- **Smart Filtering**: Prioritizes government domains (.gov, .nj.us, .us, .org)
-- **Rate Limiting**: Includes delays to be respectful to search engines
-- **Robust Parsing**: Uses BeautifulSoup for reliable HTML parsing with regex fallback
-- **Structured Output**: Saves results in organized YAML format with timestamps
+**Goal:** Create transparency around NJ affordable housing development by:
+1. Identifying municipal affordable housing commitments
+2. Tracking the status of those commitments
+3. Verifying actual development through satellite imagery
+
+**Current Status:**
+- **Stage 1 (Complete):** Municipality website discovery
+- **Stage 2 (Partial):** Affordable housing commitment scraper and database
 
 ## Requirements
 
-- Python 3.7+
-- Required packages (see requirements.txt)
+- Python 3.10+
+- Required packages: `pip install -r requirements.txt`
 
-## Installation
+## Stage 1: Municipality Website Finder
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+Finds official websites for all 565 NJ municipalities using NJ.gov directory and Google search fallback.
 
-2. **Ensure your municipalities file is ready:**
-   - The script expects `nj_municipalities.yaml` in the same directory
-   - Each municipality should be on a separate line
-
-## Usage
-
-### Basic Usage
+### Usage
 
 ```bash
 python municipality_website_finder.py
 ```
 
-### What It Does
+### Input/Output
 
-1. **Loads** municipalities from `nj_municipalities.yaml`
-2. **Searches** Google for each municipality + "NJ official website government"
-3. **Filters** results to find the most likely official government website
-4. **Scores** URLs based on domain type and municipality name matching
-5. **Saves** results to `nj_municipalities_with_websites.yaml`
+- **Input:** `nj_municipalities.yaml` — plain list, one municipality per line
+- **Output:** `nj_municipalities_with_websites.yaml` — municipality → website mappings
 
-### Output Format
+### Features
 
-The script creates a structured YAML file:
+- Dual-source approach (NJ.gov scraping + Google search fallback)
+- Smart matching to avoid wrong assignments (e.g., Asbury Park vs Cliffside Park)
+- Rate limiting and respectful delays
 
-```yaml
-municipalities:
-  Newark:
-    official_website: https://www.newarknj.gov
-    last_updated: "2024-01-15 14:30:25"
-  Jersey City:
-    official_website: https://jerseycitynj.gov
-    last_updated: "2024-01-15 14:30:45"
-  # ... and so on
+---
+
+## Stage 2: Affordable Housing Scraper
+
+Scrapes municipal websites for affordable housing commitments, plans, and obligations.
+
+### Database Setup
+
+```bash
+# Initialize the database
+python database.py --init
+
+# Load Stage 1 results (municipality websites) into the database
+python affordable_housing_scraper.py --load-stage1 nj_municipalities_with_websites.yaml
 ```
 
-## Configuration
+### Scraping
 
-### Search Query Customization
+```bash
+# Scrape a specific municipality
+python affordable_housing_scraper.py --scrape "Newark"
 
-You can modify the search query in the `search_municipality_website` method:
+# Scrape all municipalities (optionally limit)
+python affordable_housing_scraper.py --scrape-all
+python affordable_housing_scraper.py --scrape-all --limit 10
 
-```python
-search_query = f'"{municipality} NJ" "official website" "government" -wikipedia -facebook -twitter'
+# Use a custom database path
+python affordable_housing_scraper.py --db /path/to/db.sqlite --scrape-all
 ```
 
-### Scoring System
+### Database Stats
 
-The script uses a scoring system to identify official websites:
+```bash
+python database.py --stats
+```
 
-- **+10 points** for government domains (.gov, .nj.us, .us, .org)
-- **+8 points** if municipality name appears in domain
-- **+5 points** for .gov domains
-- **+4 points** for .nj.us domains
-- **+3 points** for .us domains
-- **+2 points** for .org domains
-- **+3 points** for government-related keywords (township, borough, city, town, village)
-- **-2 points** for commercial domains (.com, .net)
+---
+
+## Running Tests
+
+```bash
+# Run all tests
+python -m pytest -v
+
+# Run specific test modules
+python -m pytest test_municipality_website_finder.py -v
+python -m pytest test_database.py -v
+python -m pytest test_affordable_housing_scraper.py -v
+```
+
+---
+
+## Project Structure
+
+| File | Description |
+|------|-------------|
+| `municipality_website_finder.py` | Stage 1: Discover municipal websites |
+| `affordable_housing_scraper.py` | Stage 2: Scrape housing commitments |
+| `database.py` | SQLite database operations |
+| `nj_municipalities.yaml` | Input: list of 565 NJ municipalities |
+| `nj_municipalities_with_websites.yaml` | Stage 1 output |
+| `nj_affordable_housing.db` | SQLite database (created on init) |
+| `PROJECT_PLAN.md` | Full project roadmap and schema |
+
+---
+
+## Logging
+
+The project uses [structlog](https://www.structlog.org/). By default, logs go to structlog's configured output. For development, you can configure structlog to print to the console or set `STRUCTLOG_*` environment variables.
+
+---
 
 ## Important Notes
 
 ### Rate Limiting
 
-- **2-second delay** between searches to be respectful to Google
-- Consider running during off-peak hours for large lists
-- The script processes ~30 municipalities per minute
+- **2-second delay** between Google searches in Stage 1
+- **1.5-second delay** between page fetches in Stage 2
+- Consider running during off-peak hours for large batches
 
-### Google Search Limitations
+### Data Quality
 
-- Google may temporarily block requests if too many are made
-- Consider using a VPN or running in smaller batches
-- The script includes error handling for failed requests
+- Stage 1 results should be spot-checked; some municipalities may have incorrect or shared websites
+- Stage 2 extraction uses regex patterns; complex documents may require manual review
 
-### Accuracy
+### License
 
-- **Expected success rate**: 70-90% for official websites
-- Some municipalities may not have websites or may use non-standard domains
-- Results should be manually verified for critical applications
-
-## Troubleshooting
-
-### Common Issues
-
-1. **"No module named 'bs4'"**
-   - Run: `pip install beautifulsoup4`
-
-2. **"No module named 'yaml'"**
-   - Run: `pip install PyYAML`
-
-3. **Google blocking requests**
-   - Wait a few hours and try again
-   - Consider using a different IP address
-   - Reduce the number of municipalities processed at once
-
-4. **Low success rate**
-   - Check if Google search is working in your browser
-   - Verify your internet connection
-   - Some municipalities may genuinely not have websites
-
-### Manual Verification
-
-After running the script, you may want to:
-
-1. **Spot-check** a few results in your browser
-2. **Verify** that the domains are actually government sites
-3. **Update** any incorrect results manually in the YAML file
-
-## Example Results
-
-The script successfully finds websites like:
-- Newark: `https://www.newarknj.gov`
-- Jersey City: `https://jerseycitynj.gov`
-- Paterson: `https://patersonnj.gov`
-- Elizabeth: `https://elizabethnj.org`
-
-## License
-
-This script is provided as-is for educational and research purposes. Please use responsibly and respect website terms of service.
+This project is provided as-is for educational and research purposes. Use responsibly and respect website terms of service.
