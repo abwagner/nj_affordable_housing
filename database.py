@@ -175,6 +175,34 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
         ON scraped_pages(url)
     """)
 
+    # Official Obligations table (from NJ DCA Fourth Round data)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS official_obligations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            municipality_id INTEGER NOT NULL UNIQUE,
+            fips_code TEXT,
+            dca_municode TEXT,
+            county TEXT,
+            region INTEGER,
+            present_need INTEGER,
+            prospective_need INTEGER,
+            total_obligation INTEGER,
+            qualified_urban_aid INTEGER DEFAULT 0,
+            total_households INTEGER,
+            data_source TEXT,
+            calculation_year INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (municipality_id) REFERENCES municipalities(id)
+        )
+    """)
+
+    # Create index for official obligations
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_obligations_county
+        ON official_obligations(county)
+    """)
+
     conn.commit()
     conn.close()
     LOGGER.info(f"Database initialized at {db_path}")
@@ -532,6 +560,122 @@ def is_page_scraped(url: str, db_path: Path = DEFAULT_DB_PATH) -> bool:
 
 
 # ============================================================================
+# Official Obligations Operations
+# ============================================================================
+
+def upsert_official_obligation(
+    municipality_id: int,
+    present_need: int = None,
+    prospective_need: int = None,
+    total_obligation: int = None,
+    fips_code: str = None,
+    dca_municode: str = None,
+    county: str = None,
+    region: int = None,
+    qualified_urban_aid: int = 0,
+    total_households: int = None,
+    data_source: str = None,
+    calculation_year: int = None,
+    db_path: Path = DEFAULT_DB_PATH
+) -> int:
+    """Insert or update an official obligation record."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO official_obligations (
+            municipality_id, fips_code, dca_municode, county, region,
+            present_need, prospective_need, total_obligation,
+            qualified_urban_aid, total_households, data_source, calculation_year
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(municipality_id) DO UPDATE SET
+            fips_code = excluded.fips_code,
+            dca_municode = excluded.dca_municode,
+            county = excluded.county,
+            region = excluded.region,
+            present_need = excluded.present_need,
+            prospective_need = excluded.prospective_need,
+            total_obligation = excluded.total_obligation,
+            qualified_urban_aid = excluded.qualified_urban_aid,
+            total_households = excluded.total_households,
+            data_source = excluded.data_source,
+            calculation_year = excluded.calculation_year,
+            updated_at = CURRENT_TIMESTAMP
+    """, (municipality_id, fips_code, dca_municode, county, region,
+          present_need, prospective_need, total_obligation,
+          qualified_urban_aid, total_households, data_source, calculation_year))
+
+    conn.commit()
+    obligation_id = cursor.lastrowid
+    conn.close()
+    return obligation_id
+
+
+def get_official_obligation(municipality_id: int = None, municipality_name: str = None,
+                           db_path: Path = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    """Get official obligation for a municipality."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    if municipality_id:
+        cursor.execute("""
+            SELECT o.*, m.name as municipality_name
+            FROM official_obligations o
+            JOIN municipalities m ON o.municipality_id = m.id
+            WHERE o.municipality_id = ?
+        """, (municipality_id,))
+    elif municipality_name:
+        cursor.execute("""
+            SELECT o.*, m.name as municipality_name
+            FROM official_obligations o
+            JOIN municipalities m ON o.municipality_id = m.id
+            WHERE m.name = ?
+        """, (municipality_name,))
+    else:
+        conn.close()
+        return None
+
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_all_official_obligations(db_path: Path = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Get all official obligations with municipality names."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT o.*, m.name as municipality_name, m.official_website
+        FROM official_obligations o
+        JOIN municipalities m ON o.municipality_id = m.id
+        ORDER BY o.total_obligation DESC
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_obligations_by_county(county: str, db_path: Path = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Get all official obligations for a specific county."""
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT o.*, m.name as municipality_name, m.official_website
+        FROM official_obligations o
+        JOIN municipalities m ON o.municipality_id = m.id
+        WHERE o.county = ?
+        ORDER BY o.total_obligation DESC
+    """, (county,))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+# ============================================================================
 # Summary/Stats Operations
 # ============================================================================
 
@@ -542,11 +686,14 @@ def get_database_stats(db_path: Path = DEFAULT_DB_PATH) -> Dict[str, int]:
 
     stats = {}
     tables = ['municipalities', 'commitments', 'status_updates', 'news_articles',
-              'imagery_analyses', 'scraped_pages']
+              'imagery_analyses', 'scraped_pages', 'official_obligations']
 
     for table in tables:
-        cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
-        stats[table] = cursor.fetchone()['count']
+        try:
+            cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
+            stats[table] = cursor.fetchone()['count']
+        except sqlite3.OperationalError:
+            stats[table] = 0
 
     # Additional stats
     cursor.execute("""
@@ -559,6 +706,16 @@ def get_database_stats(db_path: Path = DEFAULT_DB_PATH) -> Dict[str, int]:
     """)
     result = cursor.fetchone()['total']
     stats['total_committed_units'] = result if result else 0
+
+    # Official obligations stats
+    try:
+        cursor.execute("""
+            SELECT SUM(total_obligation) as total FROM official_obligations
+        """)
+        result = cursor.fetchone()['total']
+        stats['total_official_obligation'] = result if result else 0
+    except sqlite3.OperationalError:
+        stats['total_official_obligation'] = 0
 
     conn.close()
     return stats

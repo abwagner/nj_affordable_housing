@@ -41,6 +41,9 @@ google_response_*.html
 *.swp
 *.swo
 
+# data files for testing
+data/
+
 # OS
 .DS_Store
 Thumbs.db
