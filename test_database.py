@@ -79,8 +79,9 @@ class TestDatabase(unittest.TestCase):
 
     def test_insert_municipality_duplicate_returns_existing_id(self):
         """Test that inserting duplicate municipality returns existing ID."""
-        id1 = insert_municipality("Jersey City", db_path=self.db_path)
-        id2 = insert_municipality("Jersey City", db_path=self.db_path)
+        # Must include county since UNIQUE constraint is on (name, county)
+        id1 = insert_municipality("Jersey City", county="Hudson", db_path=self.db_path)
+        id2 = insert_municipality("Jersey City", county="Hudson", db_path=self.db_path)
         self.assertEqual(id1, id2)
 
     def test_bulk_insert_municipalities(self):
@@ -98,19 +99,20 @@ class TestDatabase(unittest.TestCase):
 
     def test_bulk_insert_upserts_existing_website(self):
         """Test that re-running bulk_insert updates existing municipalities' websites."""
+        # Must include county since UNIQUE constraint is on (name, county)
         bulk_insert_municipalities(
-            [{"name": "Town X", "official_website": "https://old-website.gov"}],
+            [{"name": "Town X", "county": "Test County", "official_website": "https://old-website.gov"}],
             db_path=self.db_path,
         )
-        muni = get_municipality(name="Town X", db_path=self.db_path)
+        muni = get_municipality(name="Town X", county="Test County", db_path=self.db_path)
         self.assertEqual(muni["official_website"], "https://old-website.gov")
 
         # Re-run with updated website
         bulk_insert_municipalities(
-            [{"name": "Town X", "official_website": "https://new-website.gov"}],
+            [{"name": "Town X", "county": "Test County", "official_website": "https://new-website.gov"}],
             db_path=self.db_path,
         )
-        muni = get_municipality(name="Town X", db_path=self.db_path)
+        muni = get_municipality(name="Town X", county="Test County", db_path=self.db_path)
         self.assertEqual(muni["official_website"], "https://new-website.gov")
 
     def test_update_municipality_website(self):

@@ -60,35 +60,38 @@ def normalize_municipality_name(name: str) -> str:
 
 def find_municipality_id(name: str, county: str, db_path: Path) -> Optional[int]:
     """
-    Find municipality ID by name, trying various name formats.
+    Find municipality ID by name and county, trying various name formats.
     Returns municipality ID if found, None otherwise.
     """
-    # Try exact match first
-    muni = get_municipality(name=name, db_path=db_path)
+    # Try exact match with county first (most reliable)
+    muni = get_municipality(name=name, county=county, db_path=db_path)
     if muni:
         return muni['id']
 
-    # Try normalized name
+    # Try normalized name with county
     normalized = normalize_municipality_name(name)
-    muni = get_municipality(name=normalized, db_path=db_path)
+    muni = get_municipality(name=normalized, county=county, db_path=db_path)
     if muni:
         return muni['id']
 
-    # Try without suffix
+    # Try without suffix (with county)
     for suffix in [' city', ' township', ' borough', ' town', ' village',
                    ' City', ' Township', ' Borough', ' Town', ' Village']:
         if name.endswith(suffix):
             base_name = name[:-len(suffix)]
-            muni = get_municipality(name=base_name, db_path=db_path)
+            muni = get_municipality(name=base_name, county=county, db_path=db_path)
             if muni:
                 return muni['id']
 
     # Try adding Township/Borough suffix (common in NJ)
     for suffix in [' Township', ' Borough']:
-        muni = get_municipality(name=name + suffix, db_path=db_path)
+        muni = get_municipality(name=name + suffix, county=county, db_path=db_path)
         if muni:
             return muni['id']
 
+    # Note: We intentionally do NOT fall back to name-only lookups here,
+    # because NJ has many townships with the same name in different counties
+    # (e.g., Hamilton Township in Atlantic, Mercer, etc.)
     return None
 
 

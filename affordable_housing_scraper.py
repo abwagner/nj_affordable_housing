@@ -9,10 +9,10 @@ settlement agreements, and housing plans.
 import re
 import time
 import hashlib
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 
 import requests
@@ -66,6 +66,48 @@ PLANNING_KEYWORDS = [
 # File extensions to look for (PDFs often contain the detailed plans)
 DOCUMENT_EXTENSIONS = ['.pdf', '.doc', '.docx']
 
+# Priority-ordered unit extraction patterns (higher confidence first)
+# Each tuple: (pattern, confidence_boost)
+UNIT_PATTERNS_PRIORITY = [
+    # Highest confidence: explicit obligation statements
+    (r'(?:total\s+)?(?:affordable\s+)?(?:housing\s+)?obligation\s*(?:of\s*|:\s*)?(\d+)\s*units?', 1.0),
+    (r'committed\s+to\s+(?:provide\s+)?(\d+)\s*(?:affordable\s+)?units?', 0.9),
+    (r'shall\s+(?:provide|construct|build)\s+(\d+)\s*(?:affordable\s+)?units?', 0.9),
+    (r'required\s+to\s+(?:provide|build)\s+(\d+)\s*(?:affordable\s+)?units?', 0.9),
+    # Medium confidence: general mentions with clear context
+    (r'(\d+)\s+(?:affordable|deed[- ]restricted|low[- ]income|moderate[- ]income)\s+(?:housing\s+)?units?', 0.7),
+    (r'(?:affordable|low[- ]income|moderate[- ]income)\s+(?:housing\s+)?units?[:\s]+(\d+)', 0.7),
+    # Lower confidence: ambiguous patterns
+    (r'(\d+)\s+units?\s+(?:of\s+)?affordable\s+housing', 0.5),
+    (r'total\s*(?:of\s*)?(\d+)\s*(?:affordable\s*)?units?', 0.5),
+]
+
+# Patterns that indicate tentative/uncertain language (reject matches in these contexts)
+EXCLUSION_PATTERNS = [
+    r'up\s+to\s+(\d+)',
+    r'(?:may|might|could)\s+(?:include|provide|require).*?(\d+)',
+    r'(?:fewer|less)\s+than\s+(\d+)',
+    r'(?:originally|previously|formerly)\s+.*?(\d+)',
+    r'(?:proposed|potential|possible)\s+(\d+)',
+    r'(?:maximum|minimum)\s+(?:of\s+)?(\d+)',
+]
+
+# Patterns that indicate NO obligation or rejection (skip these pages)
+NEGATIVE_PATTERNS = [
+    r'(?:does\s+not|doesn\'t|do\s+not)\s+have\s+(?:an?\s+)?(?:affordable\s+)?(?:housing\s+)?obligation',
+    r'(?:no|zero)\s+(?:affordable\s+)?(?:housing\s+)?(?:obligation|requirement)',
+    r'(?:exempt|exempted)\s+from\s+(?:affordable\s+)?housing',
+    r'(?:rejected|denied|withdrawn)\s+(?:the\s+)?(?:affordable\s+)?(?:housing\s+)?(?:plan|proposal)',
+    r'not\s+(?:subject|required)\s+to\s+(?:provide\s+)?(?:affordable\s+)?housing',
+]
+
+# Words that indicate a phrase is NOT a project name
+PROJECT_EXCLUSION_WORDS = [
+    'Committee', 'Council', 'Board', 'Authority', 'Association',
+    'Commission', 'Department', 'Office', 'Agency', 'Organization',
+    'Foundation', 'Institute', 'Coalition', 'Alliance', 'Group',
+]
+
 
 @dataclass
 class AffordableHousingCommitment:
@@ -83,6 +125,24 @@ class AffordableHousingCommitment:
     source_document_type: Optional[str] = None
     date_announced: Optional[str] = None
     raw_text: Optional[str] = None
+    confidence: float = 0.0
+
+    def calculate_confidence(self) -> float:
+        """Calculate confidence score based on extracted data quality."""
+        score = 0.0
+        if self.total_units and self.total_units > 0:
+            score += 0.3
+        if self.commitment_type:
+            score += 0.2
+        if self.deadline:
+            score += 0.1
+        if self.project_name:
+            score += 0.1
+        if self.low_income_units or self.moderate_income_units:
+            score += 0.2
+        if self.location_address:
+            score += 0.1
+        return min(score, 1.0)
 
 
 class AffordableHousingScraper:
@@ -260,34 +320,22 @@ class AffordableHousingScraper:
 
         LOGGER.debug(f"Page {source_url} contains affordable housing keywords")
 
+        # Check for negative indicators (no obligation, rejection, etc.)
+        if self._has_negative_indicators(text_lower):
+            LOGGER.debug(f"Page {source_url} contains negative indicators, skipping extraction")
+            return []
+
         # Try to extract structured information
         commitment = AffordableHousingCommitment(
             municipality=municipality,
             source_url=source_url,
         )
 
-        # Extract unit counts using patterns
-        unit_patterns = [
-            r'(\d+)\s*(?:affordable|low[- ]income|moderate[- ]income)\s*(?:housing\s*)?units?',
-            r'(?:affordable|low[- ]income|moderate[- ]income)\s*(?:housing\s*)?units?[:\s]*(\d+)',
-            r'(\d+)\s*units?\s*(?:of\s*)?affordable\s*housing',
-            r'total\s*(?:of\s*)?(\d+)\s*(?:affordable\s*)?units?',
-        ]
-
-        for pattern in unit_patterns:
-            matches = re.findall(pattern, text_lower)
-            if matches:
-                try:
-                    # Take the largest number found (often the total)
-                    units = max(int(m) for m in matches if m.isdigit())
-                    if units > 0 and units < 10000:  # Sanity check
-                        commitment.total_units = units
-                        break
-                except (ValueError, TypeError):
-                    pass
+        # Extract unit counts using priority-ordered patterns
+        commitment.total_units = self._extract_unit_count(text_lower)
 
         # Extract commitment types
-        if 'settlement agreement' in text_lower or 'settlement' in text_lower:
+        if 'settlement agreement' in text_lower:
             commitment.commitment_type = 'Settlement Agreement'
         elif 'coah' in text_lower or 'council on affordable housing' in text_lower:
             commitment.commitment_type = 'COAH'
@@ -298,25 +346,11 @@ class AffordableHousingScraper:
         elif 'inclusionary' in text_lower:
             commitment.commitment_type = 'Inclusionary Zoning'
 
-        # Extract year/deadline patterns
-        year_patterns = [
-            r'by\s*(20\d{2})',
-            r'deadline[:\s]*(20\d{2})',
-            r'through\s*(20\d{2})',
-            r'(20\d{2})\s*(?:deadline|goal|target)',
-        ]
+        # Extract deadline with validation (only future years)
+        commitment.deadline = self._extract_deadline(text_lower)
 
-        for pattern in year_patterns:
-            matches = re.findall(pattern, text_lower)
-            if matches:
-                commitment.deadline = matches[0]
-                break
-
-        # Extract project names (look for capitalized phrases near "affordable")
-        project_pattern = r'(?:the\s+)?([A-Z][A-Za-z\s]+(?:Village|Gardens|Apartments|Commons|Place|Court|Homes|Manor|Towers|Heights|Park|Estate|Ridge|View|Point|Landing))'
-        project_matches = re.findall(project_pattern, text)
-        if project_matches:
-            commitment.project_name = project_matches[0].strip()
+        # Extract project names with stricter validation
+        commitment.project_name = self._extract_project_name(text)
 
         # Store relevant text snippet
         for kw in AFFORDABLE_HOUSING_KEYWORDS:
@@ -327,13 +361,131 @@ class AffordableHousingScraper:
                 commitment.raw_text = text[start:end].strip()
                 break
 
-        # Only add if we found something meaningful
+        # Calculate confidence score
+        commitment.confidence = commitment.calculate_confidence()
+
+        # Only add if we found something meaningful with sufficient confidence
         if commitment.total_units or commitment.commitment_type or commitment.project_name:
             commitments.append(commitment)
             LOGGER.info(f"Extracted commitment: {commitment.commitment_type}, "
-                       f"{commitment.total_units} units, project: {commitment.project_name}")
+                       f"{commitment.total_units} units, project: {commitment.project_name}, "
+                       f"confidence: {commitment.confidence:.2f}")
 
         return commitments
+
+    def _has_negative_indicators(self, text_lower: str) -> bool:
+        """Check if text contains negative indicators (no obligation, rejection, etc.)."""
+        for pattern in NEGATIVE_PATTERNS:
+            if re.search(pattern, text_lower):
+                return True
+        return False
+
+    def _extract_unit_count(self, text_lower: str) -> Optional[int]:
+        """
+        Extract unit count using priority-ordered patterns.
+        Returns the first valid match from highest-confidence patterns.
+        """
+        # First, find numbers that appear in exclusion contexts (tentative language)
+        excluded_numbers = set()
+        for pattern in EXCLUSION_PATTERNS:
+            matches = re.findall(pattern, text_lower)
+            for match in matches:
+                try:
+                    excluded_numbers.add(int(match))
+                except (ValueError, TypeError):
+                    pass
+
+        # Try patterns in priority order
+        for pattern, confidence in UNIT_PATTERNS_PRIORITY:
+            matches = re.findall(pattern, text_lower)
+            if matches:
+                # Filter out excluded numbers and invalid values
+                valid_units = []
+                for match in matches:
+                    try:
+                        units = int(match)
+                        if units > 0 and units < 10000 and units not in excluded_numbers:
+                            valid_units.append(units)
+                    except (ValueError, TypeError):
+                        pass
+
+                if valid_units:
+                    # For high-confidence patterns, take first match
+                    # For low-confidence patterns, take max to get total
+                    if confidence >= 0.9:
+                        return valid_units[0]
+                    else:
+                        return max(valid_units)
+
+        return None
+
+    def _extract_deadline(self, text_lower: str) -> Optional[str]:
+        """
+        Extract deadline year, filtering out historical dates.
+        Only returns years in the future or very recent past.
+        """
+        current_year = datetime.now().year
+        min_valid_year = current_year - 1  # Allow last year (plans in progress)
+        max_valid_year = current_year + 15  # Reasonable planning horizon
+
+        year_patterns = [
+            r'(?:deadline|due\s+date)(?:\s+is)?[:\s]+(20\d{2})',
+            r'(?:by|through|before)\s+(20\d{2})',
+            r'(20\d{2})\s*(?:deadline|goal|target)',
+            r'(?:complete|completed)\s+by\s+(20\d{2})',
+            r'new\s+deadline[:\s]+(?:is\s+)?(20\d{2})',
+        ]
+
+        valid_years = []
+        for pattern in year_patterns:
+            matches = re.findall(pattern, text_lower)
+            for match in matches:
+                try:
+                    year = int(match)
+                    if min_valid_year <= year <= max_valid_year:
+                        valid_years.append(str(year))
+                except (ValueError, TypeError):
+                    pass
+
+        # Return the latest valid year (most likely the current deadline)
+        if valid_years:
+            return max(valid_years)
+        return None
+
+    def _extract_project_name(self, text: str) -> Optional[str]:
+        """
+        Extract project name with stricter validation.
+        Excludes committee names, organization names, etc.
+        """
+        # Pattern for development names with common suffixes
+        project_pattern = (
+            r'(?:the\s+)?([A-Z][A-Za-z]{2,}(?:\s+[A-Z][A-Za-z]+){0,3}\s+'
+            r'(?:Village|Gardens|Apartments|Commons|Place|Court|Homes|Manor|'
+            r'Towers|Heights|Park|Estate|Ridge|View|Point|Landing|Square|'
+            r'Terrace|Green|Brook|Glen|Run|Way|Circle|Lane))'
+        )
+
+        matches = re.findall(project_pattern, text)
+
+        for match in matches:
+            name = match.strip()
+
+            # Skip if name contains exclusion words
+            if any(word in name for word in PROJECT_EXCLUSION_WORDS):
+                continue
+
+            # Skip if too short (likely partial match)
+            if len(name) < 8:
+                continue
+
+            # Skip if too many words (likely captured too much)
+            word_count = len(name.split())
+            if word_count > 5:
+                continue
+
+            return name
+
+        return None
 
     def scrape_all_municipalities(self, limit: int = None) -> List[Dict[str, Any]]:
         """Scrape all municipalities in the database."""

@@ -32,16 +32,19 @@ def init_database(db_path: Path = DEFAULT_DB_PATH) -> None:
     cursor = conn.cursor()
 
     # Municipalities table (from Stage 1)
+    # Note: UNIQUE(name, county) because NJ has multiple townships with same name
+    # in different counties (e.g., Hamilton Township in Atlantic and Mercer)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS municipalities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
             county TEXT,
             official_website TEXT,
             population INTEGER,
             last_scraped TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(name, county)
         )
     """)
 
@@ -225,28 +228,34 @@ def insert_municipality(name: str, county: str = None, official_website: str = N
         """, (name, county, official_website, population))
         conn.commit()
         municipality_id = cursor.lastrowid
-        LOGGER.info(f"Inserted municipality: {name} (ID: {municipality_id})")
+        LOGGER.info(f"Inserted municipality: {name}, {county} (ID: {municipality_id})")
         return municipality_id
     except sqlite3.IntegrityError:
-        # Municipality already exists, get its ID
-        cursor.execute("SELECT id FROM municipalities WHERE name = ?", (name,))
+        # Municipality already exists, get its ID (match on name AND county)
+        cursor.execute(
+            "SELECT id FROM municipalities WHERE name = ? AND (county = ? OR (county IS NULL AND ? IS NULL))",
+            (name, county, county)
+        )
         row = cursor.fetchone()
         if row is None:
-            raise ValueError(f"IntegrityError on insert but municipality '{name}' not found")
+            raise ValueError(f"IntegrityError on insert but municipality '{name}' in '{county}' not found")
         return row['id']
     finally:
         conn.close()
 
 
-def get_municipality(name: str = None, municipality_id: int = None,
+def get_municipality(name: str = None, municipality_id: int = None, county: str = None,
                     db_path: Path = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
-    """Get a municipality by name or ID."""
+    """Get a municipality by name (and optionally county) or ID."""
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
     if municipality_id:
         cursor.execute("SELECT * FROM municipalities WHERE id = ?", (municipality_id,))
+    elif name and county:
+        cursor.execute("SELECT * FROM municipalities WHERE name = ? AND county = ?", (name, county))
     elif name:
+        # If no county specified, return first match (may be ambiguous for duplicate names)
         cursor.execute("SELECT * FROM municipalities WHERE name = ?", (name,))
     else:
         conn.close()
@@ -290,6 +299,7 @@ def bulk_insert_municipalities(municipalities: List[Dict[str, Any]],
     """
     Bulk insert or update municipalities.
     Uses UPSERT: inserts new municipalities, updates official_website for existing ones.
+    Uniqueness is based on (name, county) to handle duplicate names across counties.
     Returns count of rows inserted or updated.
     """
     conn = get_connection(db_path)
@@ -301,9 +311,8 @@ def bulk_insert_municipalities(municipalities: List[Dict[str, Any]],
             cursor.execute("""
                 INSERT INTO municipalities (name, county, official_website, population)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
+                ON CONFLICT(name, county) DO UPDATE SET
                     official_website = COALESCE(excluded.official_website, official_website),
-                    county = COALESCE(excluded.county, county),
                     population = COALESCE(excluded.population, population),
                     updated_at = CURRENT_TIMESTAMP
             """, (muni.get('name'), muni.get('county'),
@@ -311,7 +320,7 @@ def bulk_insert_municipalities(municipalities: List[Dict[str, Any]],
             if cursor.rowcount > 0:
                 count += 1
         except Exception as e:
-            LOGGER.error(f"Error upserting {muni.get('name')}: {e}")
+            LOGGER.error(f"Error upserting {muni.get('name')}, {muni.get('county')}: {e}")
 
     conn.commit()
     conn.close()

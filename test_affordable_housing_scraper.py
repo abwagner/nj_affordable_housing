@@ -185,6 +185,121 @@ class TestAffordableHousingScraper(unittest.TestCase):
         self.assertIn("pages_found", results)
         self.assertGreaterEqual(len(results["commitments"]), 1)
 
+    # ===== New tests for improved extraction patterns =====
+
+    def test_extract_rejects_tentative_language(self):
+        """Test that 'up to X units' is not extracted as committed units."""
+        html = """
+        <html><body>
+        <p>The plan may include up to 500 affordable units depending on approval.
+        Settlement agreement pending.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        # Should not extract 500 as it's tentative
+        if result and result[0].total_units:
+            self.assertNotEqual(result[0].total_units, 500)
+
+    def test_extract_prefers_obligation_over_general(self):
+        """Test that explicit obligation numbers take priority."""
+        html = """
+        <html><body>
+        <p>The town discussed 1000 affordable units in various proposals.
+        Total housing obligation: 250 units. Settlement agreement.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].total_units, 250)
+
+    def test_negative_indicator_skips_extraction(self):
+        """Test that negative phrases prevent extraction."""
+        html = """
+        <html><body>
+        <p>This township does not have an affordable housing obligation.
+        The municipality is exempt from housing requirements.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        self.assertEqual(result, [])
+
+    def test_project_name_excludes_committees(self):
+        """Test that committee names are not extracted as project names."""
+        html = """
+        <html><body>
+        <p>The Riverside Gardens Committee met to discuss 50 affordable housing units.
+        Settlement agreement in progress.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        # Should have a commitment but project_name should be None or not contain "Committee"
+        if result and result[0].project_name:
+            self.assertNotIn("Committee", result[0].project_name)
+
+    def test_deadline_rejects_past_years(self):
+        """Test that historical years are not extracted as deadlines."""
+        html = """
+        <html><body>
+        <p>By 2015 the original plan was rejected. The new deadline is 2030.
+        100 affordable housing units required under settlement agreement.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].deadline, "2030")
+
+    def test_confidence_scoring_high_for_complete_data(self):
+        """Test high confidence for extractions with multiple data points."""
+        html = """
+        <html><body>
+        <p>Housing obligation: 500 units. COAH approved. Deadline: 2030.
+        The Meadowbrook Village project at 123 Main Street.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        self.assertEqual(len(result), 1)
+        self.assertGreater(result[0].confidence, 0.5)
+
+    def test_confidence_scoring_low_for_minimal_data(self):
+        """Test low confidence for extractions with minimal data."""
+        html = """
+        <html><body>
+        <p>Something about affordable housing in the community.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        # Either no result or low confidence
+        if result:
+            self.assertLess(result[0].confidence, 0.3)
+
+    def test_extract_committed_to_pattern(self):
+        """Test 'committed to' pattern extracts correctly."""
+        html = """
+        <html><body>
+        <p>The municipality has committed to provide 175 affordable units
+        as part of the settlement agreement by 2029.</p>
+        </body></html>
+        """
+        result = self.scraper._extract_housing_info(
+            html, "https://example.com", "Test Town"
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].total_units, 175)
+
 
 class TestLoadStage1Results(unittest.TestCase):
     """Tests for load_stage1_results_to_db."""
